@@ -81,12 +81,53 @@ def init(config, benchmark):
 def get_system_info():
     return systeminfo.SystemInfo()
 
-def execute_benchmark(benchmark, output_handler):
+def execute_runset(benchmark, runSet, output_handler, coreAssignment, memoryAssignment, cpu_packages):
+    # get times before runSet
+    energy_measurement = EnergyMeasurement.create_if_supported()
+    ruBefore = resource.getrusage(resource.RUSAGE_CHILDREN)
+    walltime_before = util.read_monotonic_time()
+    if energy_measurement:
+        energy_measurement.start()
 
-    run_sets_executed = 0
+    output_handler.output_before_run_set(runSet)
 
-    logging.debug("I will use %s threads.", benchmark.num_of_threads)
+    # put all runs into a queue
+    for run in runSet.runs:
+        _Worker.put(run)
 
+    # create some workers
+    for i in range(benchmark.num_of_threads):
+        cores = coreAssignment[i] if coreAssignment else None
+        memBanks = memoryAssignment[i] if memoryAssignment else None
+        user = benchmark.config.users[i] if benchmark.config.users else None
+        WORKER_THREADS.append(_Worker(benchmark, cores, memBanks, user, output_handler))
+
+    # wait until all tasks are done
+    try:
+        _Worker.working_queue.join()
+    except KeyboardInterrupt:
+        stop()
+
+    # get times after runSet
+    walltime_after = util.read_monotonic_time()
+    energy = energy_measurement.stop() if energy_measurement else None
+    usedWallTime = walltime_after - walltime_before
+    ruAfter = resource.getrusage(resource.RUSAGE_CHILDREN)
+    usedCpuTime = (ruAfter.ru_utime + ruAfter.ru_stime) \
+                - (ruBefore.ru_utime + ruBefore.ru_stime)
+    if energy and cpu_packages:
+        energy = {pkg: energy[pkg] for pkg in energy if pkg in cpu_packages}
+
+    if STOPPED_BY_INTERRUPT:
+        output_handler.set_error('interrupted', runSet)
+    output_handler.output_after_run_set(runSet, cputime=usedCpuTime, walltime=usedWallTime, energy=energy)
+
+    for worker in WORKER_THREADS:
+        worker.cleanup()
+
+    return 0
+
+def get_limits(benchmark):
     if benchmark.requirements.cpu_model \
             or benchmark.requirements.cpu_cores != benchmark.rlimits.get(CORELIMIT, None) \
             or benchmark.requirements.memory != benchmark.rlimits.get(MEMLIMIT, None):
@@ -128,65 +169,33 @@ def execute_benchmark(benchmark, output_handler):
         elif len(benchmark.config.users) != len(set(benchmark.config.users)):
             sys.exit('Same user account was specified multiple times, please specify {} separate accounts, or only one account.'.format(benchmark.num_of_threads))
 
+    return (coreAssignment, memoryAssignment, cpu_packages)
+
+
+def execute_benchmark(benchmark, output_handler):
+
+    run_sets_executed = 0
+
+    logging.debug("I will use %s threads.", benchmark.num_of_threads)
+
+    coreAssignment, memoryAssignment, cpu_packages = get_limits(benchmark)
+
     throttle_check = systeminfo.CPUThrottleCheck()
     swap_check = systeminfo.SwapCheck()
 
     # iterate over run sets
     for runSet in benchmark.run_sets:
-
         if STOPPED_BY_INTERRUPT:
             break
 
         if not runSet.should_be_executed():
             output_handler.output_for_skipping_run_set(runSet)
-
         elif not runSet.runs:
             output_handler.output_for_skipping_run_set(runSet, "because it has no files")
-
         else:
             run_sets_executed += 1
-            # get times before runSet
-            energy_measurement = EnergyMeasurement.create_if_supported()
-            ruBefore = resource.getrusage(resource.RUSAGE_CHILDREN)
-            walltime_before = util.read_monotonic_time()
-            if energy_measurement:
-                energy_measurement.start()
-
-            output_handler.output_before_run_set(runSet)
-
-            # put all runs into a queue
-            for run in runSet.runs:
-                _Worker.put(run)
-
-            # create some workers
-            for i in range(benchmark.num_of_threads):
-                cores = coreAssignment[i] if coreAssignment else None
-                memBanks = memoryAssignment[i] if memoryAssignment else None
-                user = benchmark.config.users[i] if benchmark.config.users else None
-                WORKER_THREADS.append(_Worker(benchmark, cores, memBanks, user, output_handler))
-
-            # wait until all tasks are done,
-            try:
-                _Worker.working_queue.join()
-            except KeyboardInterrupt:
-                stop()
-
-            # get times after runSet
-            walltime_after = util.read_monotonic_time()
-            energy = energy_measurement.stop() if energy_measurement else None
-            usedWallTime = walltime_after - walltime_before
-            ruAfter = resource.getrusage(resource.RUSAGE_CHILDREN)
-            usedCpuTime = (ruAfter.ru_utime + ruAfter.ru_stime) \
-                        - (ruBefore.ru_utime + ruBefore.ru_stime)
-            if energy and cpu_packages:
-                energy = {pkg: energy[pkg] for pkg in energy if pkg in cpu_packages}
-
-            if STOPPED_BY_INTERRUPT:
-                output_handler.set_error('interrupted', runSet)
-            output_handler.output_after_run_set(runSet, cputime=usedCpuTime, walltime=usedWallTime, energy=energy)
-
-            for worker in WORKER_THREADS:
-                worker.cleanup()
+            execute_runset(benchmark, runSet, output_handler,
+                           coreAssignment, memoryAssignment, cpu_packages)
 
     if throttle_check.has_throttled():
         logging.warning('CPU throttled itself during benchmarking due to overheating. '
