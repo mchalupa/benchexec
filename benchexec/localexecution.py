@@ -156,7 +156,7 @@ def execute_benchmark(benchmark, output_handler):
 
             # put all runs into a queue
             for run in runSet.runs:
-                _Worker.working_queue.put(run)
+                _Worker.put(run)
 
             # create some workers
             for i in range(benchmark.num_of_threads):
@@ -241,9 +241,21 @@ class _Worker(threading.Thread):
         self.start()
 
 
+    def all_done():
+        return _Worker.working_queue.empty() or STOPPED_BY_INTERRUPT
+
+    def get():
+        return _Worker.working_queue.get_nowait()
+
+    def put(run):
+        return _Worker.working_queue.put(run)
+
+    def task_done():
+        return _Worker.working_queue.task_done()
+
     def run(self):
-        while not _Worker.working_queue.empty() and not STOPPED_BY_INTERRUPT:
-            currentRun = _Worker.working_queue.get_nowait()
+        while not _Worker.all_done():
+            currentRun = _Worker.get()
             try:
                 logging.debug('Executing run "%s"', currentRun.identifier)
                 self.execute(currentRun)
@@ -254,7 +266,7 @@ class _Worker(threading.Thread):
                 logging.critical(e)
             except BaseException as e:
                 logging.exception('Exception during run execution')
-            _Worker.working_queue.task_done()
+            _Worker.task_done()
 
 
     def execute(self, run):
