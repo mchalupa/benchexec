@@ -61,6 +61,12 @@ class BenchExec(object):
         parser = self.create_argument_parser()
         self.config = parser.parse_args(argv[1:])
 
+        if len(self.config.files) == 0:
+            parser.error("At least one benchmark (xml file) is required.")
+
+        if self.config.listener_mode and len(self.config.files) != 1:
+            parser.error("In the listener mode, only a single benchmark can be executed.")
+
         for arg in self.config.files:
             if not os.path.exists(arg) or not os.path.isfile(arg):
                 parser.error("File {0} does not exist.".format(repr(arg)))
@@ -81,6 +87,11 @@ class BenchExec(object):
             returnCode = returnCode or rc
             logging.debug("Benchmark %r is done.", arg)
 
+        if self.config.listener_mode:
+            assert len(self.config.files) == 1
+            rc = self.listen_for_runs(self.config.files[0])
+            returnCode = returnCode or rc
+
         logging.debug("I think my job is done. Have a nice day!")
         return returnCode
 
@@ -100,7 +111,7 @@ class BenchExec(object):
                The tool table-generator can be used to create tables for the results.
                Part of BenchExec: https://github.com/sosy-lab/benchexec/""")
 
-        parser.add_argument("files", nargs='+', metavar="FILE",
+        parser.add_argument("files", nargs='*', metavar="FILE",
                           help="XML file with benchmark definition")
         parser.add_argument("-d", "--debug",
                           action="store_true",
@@ -158,6 +169,9 @@ class BenchExec(object):
                           default=None,
                           metavar="N",
                           help="Limit each run of the tool to N CPU cores (-1 to disable).")
+
+        parser.add_argument("-l", "--listen", dest="listener_mode", action="store_true",
+                          help="Listen on a port (default 3333) and queue new benchmarks on the fly")
 
         parser.add_argument("--allowedCores",
                           dest="coreset", default=None, type=util.parse_int_list,
@@ -300,6 +314,42 @@ class BenchExec(object):
                 logging.warning('Could not add files to git repository: %s', e)
         return result
 
+    def listen_for_runs(self, benchmark_file):
+        """
+        Execute a single benchmark as defined in a file.
+        If called directly, ensure that config and executor attributes are set up.
+        @param benchmark_file: the name of a benchmark-definition XML file
+        @return: a result value from the executor module
+        """
+        benchmark = Benchmark(benchmark_file, self.config,
+                              self.config.start_time or time.localtime())
+
+        self.executor.init(self.config, benchmark)
+        output_handler = OutputHandler(benchmark, self.executor.get_system_info(),
+                                       self.config.compress_results)
+
+        logging.debug("Starting listening mode")
+
+        try:
+            result = self.executor.listen_for_runs(benchmark, output_handler)
+        finally:
+            output_handler.close()
+            # remove useless log folder if it is empty
+            try:
+                os.rmdir(benchmark.log_folder)
+            except:
+                pass
+
+        if self.config.commit and not self.stopped_by_interrupt:
+            try:
+                util.add_files_to_git_repository(self.config.output_path,
+                        output_handler.all_created_files,
+                        self.config.commit_message + '\n\n'
+                            + output_handler.description + '\n\n'
+                            + str(output_handler.statistics))
+            except OSError as e:
+                logging.warning('Could not add files to git repository: %s', e)
+        return result
 
     def check_existing_results(self, benchmark):
         """

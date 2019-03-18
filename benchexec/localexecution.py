@@ -91,23 +91,6 @@ def execute_runset(benchmark, runSet, output_handler, coreAssignment, memoryAssi
 
     output_handler.output_before_run_set(runSet)
 
-    # put all runs into a queue
-    for run in runSet.runs:
-        _Worker.put(run)
-
-    # create some workers
-    for i in range(benchmark.num_of_threads):
-        cores = coreAssignment[i] if coreAssignment else None
-        memBanks = memoryAssignment[i] if memoryAssignment else None
-        user = benchmark.config.users[i] if benchmark.config.users else None
-        WORKER_THREADS.append(_Worker(benchmark, cores, memBanks, user, output_handler))
-
-    # wait until all tasks are done
-    try:
-        _Worker.working_queue.join()
-    except KeyboardInterrupt:
-        stop()
-
     # get times after runSet
     walltime_after = util.read_monotonic_time()
     energy = energy_measurement.stop() if energy_measurement else None
@@ -171,6 +154,29 @@ def get_limits(benchmark):
 
     return (coreAssignment, memoryAssignment, cpu_packages)
 
+def listen_for_runs(benchmark, output_handler):
+
+    coreAssignment, memoryAssignment, _ = get_limits(benchmark)
+    listener = _ListenerThread()
+
+    # create some workers
+    for i in range(benchmark.num_of_threads):
+        cores = coreAssignment[i] if coreAssignment else None
+        memBanks = memoryAssignment[i] if memoryAssignment else None
+        user = benchmark.config.users[i] if benchmark.config.users else None
+        WORKER_THREADS.append(_ListeningWorker(benchmark, cores, memBanks, user, output_handler))
+
+    # wait until the listener listens and then just check
+    # that all the jobs are done
+    try:
+        listener.join()
+        _Worker.working_queue.join()
+    except KeyboardInterrupt:
+        stop()
+        # should not block now, but set a timeout
+        listener.join(timeout=2)
+
+    return 0
 
 def execute_benchmark(benchmark, output_handler):
 
@@ -326,3 +332,51 @@ class _Worker(threading.Thread):
 
     def cleanup(self):
         self.run_executor.check_for_new_files_in_home()
+
+class _ListeningWorker(_Worker):
+    """
+    A ListeningWorker is a deamonic thread that takes jobs from the working_queue and runs them.
+    When the queue is empty, it waits until a new job appears.
+    """
+    working_queue = Queue()
+
+    def __init__(self, benchmark, my_cpus, my_memory_nodes, my_user, output_handler):
+        _Worker.__init__(self, benchmark, my_cpus, my_memory_nodes, my_user, output_handler)
+
+    def all_done():
+        return STOPPED_BY_INTERRUPT
+
+    def get():
+        return _Worker.working_queue.get()
+
+
+class _ListenerThread(threading.Thread):
+    """
+    The ListenerThread is a thread that listens and queues new files into benchmark
+    """
+
+    HOST='' # allow connections from anywhere
+    PORT=3333
+    def __init__(self):
+        threading.Thread.__init__(self)
+
+        print("Created listener thread")
+        self.start()
+
+    def run(self):
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((_ListenerThread.HOST, _ListenerThread.PORT))
+            s.listen()
+            conn, addr = s.accept()
+            with conn:
+                print('Connected by', addr)
+                while True:
+                    data = conn.recv(1024)
+                    print(data)
+                    if not data or data == '':
+                        break
+        while not STOPPED_BY_INTERRUPT:
+            time.sleep(1)
+        print("The listener thread exits")
+
