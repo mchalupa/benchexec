@@ -166,19 +166,10 @@ def execute_benchmark(benchmark, output_handler):
                 WORKER_THREADS.append(_Worker(benchmark, cores, memBanks, user, output_handler))
 
             # wait until all tasks are done,
-            # instead of queue.join(), we use a loop and sleep(1) to handle KeyboardInterrupt
-            finished = False
-            while not finished and not STOPPED_BY_INTERRUPT:
-                try:
-                    _Worker.working_queue.all_tasks_done.acquire()
-                    finished = (_Worker.working_queue.unfinished_tasks == 0)
-                finally:
-                    _Worker.working_queue.all_tasks_done.release()
-
-                try:
-                    time.sleep(0.1) # sleep some time
-                except KeyboardInterrupt:
-                    stop()
+            try:
+                _Worker.working_queue.join()
+            except KeyboardInterrupt:
+                stop()
 
             # get times after runSet
             walltime_after = util.read_monotonic_time()
